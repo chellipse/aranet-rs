@@ -3,8 +3,9 @@ use arrayref::{array_ref, array_refs};
 use bluer::{
     agent::{self, Agent, ReqResult},
     gatt::remote::Characteristic,
-    Address, Device,
+    AdapterEvent, Address, Device,
 };
+use futures::StreamExt;
 use prometheus::{register, Gauge, IntGauge};
 use serde::Deserialize;
 use std::{
@@ -296,40 +297,70 @@ OPTIONS
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let cfg = try_get_cfg()?;
-    let mac_array = str_mac_to_array(&cfg.mac)?;
+    let cfg = try_get_cfg().unwrap();
+    let mac_array = str_mac_to_array(&cfg.mac).unwrap();
 
-    let session = bluer::Session::new().await?;
+    let session = bluer::Session::new().await.unwrap();
 
     let _agent = session
         .register_agent(Agent {
             request_passkey: Some(Box::new(get_passkey)),
             ..Default::default()
         })
-        .await?;
+        .await
+        .unwrap();
 
-    let adapter = session.adapter(&cfg.adapter)?;
-    adapter.set_powered(true).await?;
+    let adapter = session.adapter(&cfg.adapter).unwrap();
+    adapter.set_powered(true).await.unwrap();
 
-    let dev = adapter.device(Address::new(mac_array))?;
+    let cfg_address = Address::new(mac_array);
 
-    if !dev.is_paired().await? {
-        println!("Device is not paired. Attempting to pair...");
+    if let Ok(mut stream) = adapter.discover_devices().await {
+        eprintln!("Discovering...");
+        while let Some(event) = stream.next().await {
+            eprintln!("{event:?}");
+            match event {
+                AdapterEvent::DeviceAdded(device) => {
+                    if device == cfg_address {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
 
-        match dev.pair().await {
-            Ok(_) => println!("Pairing successful!"),
-            Err(err) => eprintln!("Pairing failed: {:?}", err),
+    let dev = adapter.device(cfg_address).unwrap();
+
+    dev.connect().await.unwrap();
+
+    match dev.is_paired().await {
+        Ok(is_paired) => {
+            if !is_paired {
+                println!("Device is not paired. Attempting to pair...");
+
+                match dev.pair().await {
+                    Ok(_) => println!("Pairing successful!"),
+                    Err(err) => eprintln!("Pairing failed: {:?}", err),
+                }
+            }
+        }
+        Err(e) => {
+            println!("Device Err: {e:?}");
+            println!(
+                "Available device addresses: {:#?}",
+                adapter.device_addresses().await
+            );
+            return Ok(());
         }
     }
-
-    dev.connect().await?;
 
     // while dev.is_services_resolved().await == Ok(false) {
     // println!("Waiting for service resolve...");
     // tokio::time::sleep(Duration::from_millis(20)).await;
     // }
 
-    let endpoint = map_device_endpoints(&dev).await?;
+    let endpoint = map_device_endpoints(&dev).await.unwrap();
 
     if let Some(arg) = env::args().skip(1).next() {
         match arg.as_str() {
@@ -340,14 +371,14 @@ async fn main() -> Result<()> {
                 println!("{PKG_NAME}: v{VERSION}");
             }
             "--oneline" => {
-                let readings = endpoint.read().await?;
+                let readings = endpoint.read().await.unwrap();
                 readings.print_oneline(cfg.fahrenheit.unwrap_or(false));
             }
             "--streaming-oneline" => loop {
-                if !dev.is_connected().await? {
-                    dev.connect().await?;
+                if !dev.is_connected().await.unwrap() {
+                    dev.connect().await.unwrap();
                 }
-                let readings = endpoint.read().await?;
+                let readings = endpoint.read().await.unwrap();
                 readings.print_oneline(cfg.fahrenheit.unwrap_or(false));
                 tokio::time::sleep(Duration::from_secs(cfg.stream_freq.unwrap_or(30))).await;
             },
@@ -355,36 +386,51 @@ async fn main() -> Result<()> {
                 let address = cfg
                     .prometheus_address
                     .unwrap_or("127.0.0.1:8080".to_string())
-                    .to_socket_addrs()?
+                    .to_socket_addrs()
+                    .unwrap()
                     .next()
                     .unwrap();
-                metric::start_prometheus_listener_task(address).await?;
+                metric::start_prometheus_listener_task(address)
+                    .await
+                    .unwrap();
 
-                let metric_co2 = IntGauge::new("aranet_co2", "Co2 in ppm")?;
-                register(Box::new(metric_co2.clone())).map(|()| metric_co2.clone())?;
+                let metric_co2 = IntGauge::new("aranet_co2", "Co2 in ppm").unwrap();
+                register(Box::new(metric_co2.clone()))
+                    .map(|()| metric_co2.clone())
+                    .unwrap();
 
-                let metric_temp_f = Gauge::new("aranet_temp_fahrenheit", "Temp in Fahrenheit")?;
-                register(Box::new(metric_temp_f.clone())).map(|()| metric_temp_f.clone())?;
+                let metric_temp_f =
+                    Gauge::new("aranet_temp_fahrenheit", "Temp in Fahrenheit").unwrap();
+                register(Box::new(metric_temp_f.clone()))
+                    .map(|()| metric_temp_f.clone())
+                    .unwrap();
 
-                let metric_temp_c = Gauge::new("aranet_temp_celsius", "Temp in Celsius")?;
-                register(Box::new(metric_temp_c.clone())).map(|()| metric_temp_c.clone())?;
+                let metric_temp_c = Gauge::new("aranet_temp_celsius", "Temp in Celsius").unwrap();
+                register(Box::new(metric_temp_c.clone()))
+                    .map(|()| metric_temp_c.clone())
+                    .unwrap();
 
                 let metric_relative_humidity =
-                    IntGauge::new("aranet_relative_humidity", "Relative humidity %")?;
+                    IntGauge::new("aranet_relative_humidity", "Relative humidity %").unwrap();
                 register(Box::new(metric_relative_humidity.clone()))
-                    .map(|()| metric_relative_humidity.clone())?;
+                    .map(|()| metric_relative_humidity.clone())
+                    .unwrap();
 
-                let metric_preasure = Gauge::new("aranet_preasure", "Air preasure in hPa")?;
-                register(Box::new(metric_preasure.clone())).map(|()| metric_preasure.clone())?;
+                let metric_preasure = Gauge::new("aranet_preasure", "Air preasure in hPa").unwrap();
+                register(Box::new(metric_preasure.clone()))
+                    .map(|()| metric_preasure.clone())
+                    .unwrap();
 
-                let metric_bat = IntGauge::new("aranet_bat", "Aranet4 battery %")?;
-                register(Box::new(metric_bat.clone())).map(|()| metric_bat.clone())?;
+                let metric_bat = IntGauge::new("aranet_bat", "Aranet4 battery %").unwrap();
+                register(Box::new(metric_bat.clone()))
+                    .map(|()| metric_bat.clone())
+                    .unwrap();
 
                 loop {
-                    if !dev.is_connected().await? {
-                        dev.connect().await?;
+                    if !dev.is_connected().await.unwrap() {
+                        dev.connect().await.unwrap();
                     }
-                    let readings = endpoint.read().await?;
+                    let readings = endpoint.read().await.unwrap();
                     readings.print_oneline(cfg.fahrenheit.unwrap_or(false));
 
                     metric_co2.set(readings.c02 as i64);
@@ -400,7 +446,7 @@ async fn main() -> Result<()> {
             _ => todo!(),
         }
     } else {
-        let readings = endpoint.read().await?;
+        let readings = endpoint.read().await.unwrap();
         println!("{}", readings);
     }
 
