@@ -18,3 +18,9 @@ prometheus_address = "127.0.0.1:8080" # optional
 * doesn't currently support parsing data other than current_readings
 * only works with current_readings on firmware >= v1.2 afaik
 * only works on linux
+
+### TODO
+
+[x] switch to clap based CLI
+[ ] Fallback to accepting passcode via terminal if pinentry-qt isn't present
+
