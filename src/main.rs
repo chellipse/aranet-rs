@@ -1,24 +1,26 @@
 use std::{env, fs, net::ToSocketAddrs, time::Duration};
 
 use anyhow::Result;
-use bluer::{agent::Agent, AdapterEvent, Address};
+use bluer::{agent::Agent, AdapterEvent, Address, Device};
 use clap::{Parser, Subcommand};
-use futures::StreamExt;
+use futures::prelude::*;
 use prometheus::{register, Gauge, IntGauge};
 use serde::{de::DeserializeOwned, Deserialize};
 
 use aranet::{bluetooth::*, metric};
+use tokio::time::timeout;
 
 #[derive(Deserialize)]
 pub struct Cfg {
     /// EX: hci0
     pub adapter: String,
     /// FORMAT: ED:12:89:6C:08:37
-    pub mac: String,
+    pub macs: Vec<String>,
     pub fahrenheit: Option<bool>,
     // Seconds
     pub stream_freq: Option<u64>,
     pub prometheus_address: Option<String>,
+    pub conn_timeout_ms: Option<u64>,
 }
 
 pub fn try_get_cfg<T: DeserializeOwned>() -> Result<T> {
@@ -52,7 +54,12 @@ fn main() {
 
     rt.block_on(async {
         let cfg = try_get_cfg::<Cfg>().unwrap();
-        let mac_array = str_mac_to_array(&cfg.mac).unwrap();
+        let mut addresses: Vec<Address> = cfg
+            .macs
+            .iter()
+            .map(|x| str_mac_to_array(x).unwrap())
+            .map(|x| Address::new(x))
+            .collect();
 
         let session = bluer::Session::new().await.unwrap();
 
@@ -67,26 +74,77 @@ fn main() {
         let adapter = session.adapter(&cfg.adapter).unwrap();
         adapter.set_powered(true).await.unwrap();
 
-        let cfg_address = Address::new(mac_array);
+        let main_adapter = adapter.clone();
 
-        if let Ok(mut stream) = adapter.discover_devices().await {
-            eprintln!("Discovering...");
-            while let Some(event) = stream.next().await {
-                eprintln!("{event:?}");
-                match event {
-                    AdapterEvent::DeviceAdded(device) => {
-                        if device == cfg_address {
-                            break;
+        let (dev_sender, mut dev_receiver) = tokio::sync::mpsc::unbounded_channel::<Device>();
+
+        tokio::spawn(async move {
+            if let Ok(mut stream) = adapter.discover_devices().await {
+                eprintln!("Discovering...");
+                while let Some(event) = stream.next().await {
+                    // eprintln!("Event: {event:?}");
+                    match event {
+                        AdapterEvent::DeviceAdded(address) => {
+                            if let Some(idx) = addresses.iter().position(|x| x == &address) {
+                                // Remove found addresses so we don't try them multiple times
+                                addresses.swap_remove(idx);
+
+                                eprintln!("Found: {address:?}");
+                                if let Ok(device) = adapter.device(address) {
+                                    let sender = dev_sender.clone();
+                                    tokio::spawn(async move {
+                                        if !device.is_connected().await? {
+                                            eprintln!("    Connecting: {device:?}");
+                                            device.connect().await?;
+                                            eprintln!("    Connected!: {device:?}");
+                                        }
+
+                                        eprintln!("    Scanning: {device:?}");
+
+                                        let mut count: u32 = 0;
+                                        loop {
+                                            let x = device.rssi().await?;
+                                            eprintln!("    RSSI: {x:?} on {device:?}");
+                                            match x {
+                                                Some(_) => {
+                                                    sender.send(device).unwrap();
+                                                    break;
+                                                }
+                                                _ => {
+                                                    count += 1;
+                                                    tokio::time::sleep(Duration::from_millis(200))
+                                                        .await
+                                                }
+                                            }
+
+                                            // Just so we don't busy loop forever on connections which aren't present
+                                            // this probably can't happen but i'm not 100% sure.
+                                            if count > 100 {
+                                                break;
+                                            }
+                                        }
+
+                                        Ok::<(), bluer::Error>(())
+                                    });
+                                }
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        };
+        });
 
-        let dev = adapter.device(cfg_address).unwrap();
+        // dev should already be connected from the task
+        let dev = timeout(
+            Duration::from_millis(cfg.conn_timeout_ms.unwrap_or(15000)),
+            dev_receiver.recv(),
+        )
+        .await
+        .expect("Timeout while searching for device")
+        .expect("Failed to find device within range");
 
-        dev.connect().await.unwrap();
+        eprintln!("Dev: {dev:?}");
 
         match dev.is_paired().await {
             Ok(is_paired) => {
@@ -103,16 +161,11 @@ fn main() {
                 println!("Device Err: {e:?}");
                 println!(
                     "Available device addresses: {:#?}",
-                    adapter.device_addresses().await
+                    main_adapter.device_addresses().await
                 );
                 return;
             }
         }
-
-        // while dev.is_services_resolved().await == Ok(false) {
-        // println!("Waiting for service resolve...");
-        // tokio::time::sleep(Duration::from_millis(20)).await;
-        // }
 
         let endpoint = map_device_endpoints(&dev).await.unwrap();
 
@@ -122,14 +175,15 @@ fn main() {
                     let readings = endpoint.read().await.unwrap();
                     readings.print_oneline(cfg.fahrenheit.unwrap_or(false));
                 }
-                Cmd::StreamingOneline => {
+                Cmd::StreamingOneline => loop {
                     if !dev.is_connected().await.unwrap() {
                         dev.connect().await.unwrap();
                     }
+
                     let readings = endpoint.read().await.unwrap();
                     readings.print_oneline(cfg.fahrenheit.unwrap_or(false));
                     tokio::time::sleep(Duration::from_secs(cfg.stream_freq.unwrap_or(30))).await;
-                }
+                },
                 Cmd::Service => {
                     let address = cfg
                         .prometheus_address

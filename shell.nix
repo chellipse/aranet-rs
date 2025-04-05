@@ -1,12 +1,12 @@
 let
   rust_overlay = import (builtins.fetchTarball {
-    url = "https://github.com/oxalica/rust-overlay/archive/6a3dc6ce4132bd57359214d986db376f2333c14d.tar.gz"; # master
-    sha256 = "1v4h0fiifb7n3cfaqpnkkd4ynbn8ygypcwa92n5k3klyyqcy4nqq";
+    url = "https://github.com/oxalica/rust-overlay/archive/b4734ce867252f92cdc7d25f8cc3b7cef153e703.tar.gz"; # master
+    sha256 = "1mkyvk2bl6yf95l5n604gg3zzh3m5riwcbkyd52i0gp10ni4jz2i"; # 2025-04-05T21·08+00
   });
   
   pkgs = import (fetchTarball {
-    url = "https://github.com/NixOS/nixpkgs/archive/9d3ae807ebd2981d593cddd0080856873139aa40.tar.gz"; # nixos-unstable
-    sha256 = "0bjqgsprq9fgl5yh58dk59xmchi4dajq3sf5i447q02dbiasjsil";
+    url = "https://github.com/NixOS/nixpkgs/archive/2c8d3f48d33929642c1c12cd243df4cc7d2ce434.tar.gz"; # nixos-unstable
+    sha256 = "0lbn29dn647kgf3g3nzch8an3m0gn2ysrmq8l7q6lzc8lgwgif8p"; # 2025-04-05T21·08+00
   }) { overlays = [ rust_overlay ]; };
 
   rust = pkgs.rust-bin.stable.latest.default.override {
